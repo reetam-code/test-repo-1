@@ -4,6 +4,9 @@ import { pool, ensureSchema } from './db.js'
 const app = express()
 app.use(express.json())
 
+// The load balancer's health check. No database call, so a slow database never takes the service out.
+app.get('/health', (_req, res) => res.json({ ok: true }))
+
 app.get('/api/tasks', async (_req, res) => {
   const [rows] = await pool.query('SELECT id, title, done FROM tasks ORDER BY id')
   res.json(rows.map((r) => ({ ...r, done: Boolean(r.done) })))
