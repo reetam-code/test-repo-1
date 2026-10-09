@@ -4,6 +4,8 @@ import { pool, ensureSchema } from './db.js'
 const app = express()
 app.use(express.json())
 
+app.get('/health-check', (_req, res) => res.sendStatus(200))
+
 app.get('/api/tasks', async (_req, res) => {
   const [rows] = await pool.query('SELECT id, title, done FROM tasks ORDER BY id')
   res.json(rows.map((r) => ({ ...r, done: Boolean(r.done) })))
