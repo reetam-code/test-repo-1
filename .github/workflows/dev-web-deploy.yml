@@ -1,0 +1,379 @@
+name: Dev Admin Deploy to ECS
+
+on:
+  push:
+    branches:
+      - main
+
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/dev-web-deploy.yml'
+  workflow_dispatch:
+
+# queues new runs, never cancels 
+concurrency:
+  group: test-repo-dev-web-deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ACCOUNT_ID: "890290782969"
+  AWS_DEPLOY_ROLE_ARN: arn:aws:iam::890290782969:role/github-actions-test-repo-dev-project-deploy-oidc-role
+  ECR_REPO: test-repo-dev-web
+  DOCKERFILE_PATH: frontend/Dockerfile
+  ECS_TASK_DEFINITION_NAME: test-repo-dev-web
+  ECS_CONTAINER_NAME: test-repo-dev-web-container
+  ECS_CONTAINER_PORT: '4173'
+  CPU: '500'
+  MEMORY: '500'
+  CLUSTER: test-repo-dev-ecs
+  SERVICE: test-repo-dev-web-service
+  TARGET_GROUP_NAME: test-repo-dev-web
+  HEALTH_CHECK_PATH_TG: /api/health-check
+  HEALTH_CHECK_PATH_ECS: localhost:80/api/health-check
+  VPC_ID: vpc-0fea3a4b317aea972
+  ALB_LISTENER_ARN: arn:aws:elasticloadbalancing:ap-south-1:890290782969:listener/app/cdbd-dev-alb/abe80e14e3899a07/48ee1038d463a38f
+  HOST: test-repo-web.dev.projectreview.co
+  DD_SERVICE: test-repo-dev-web
+  DD_ENV: dev
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Initialize Pipeline
+        run: echo "pipeline started"
+
+      - name: Checkout Code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 #v6
+
+      - name: Gitleaks secret scan
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
+            | tar -xz -C /tmp gitleaks
+          chmod +x /tmp/gitleaks
+          /tmp/gitleaks detect --source . --redact --exit-code 1 --verbose
+
+      - name: Debug OIDC claims
+        run: |
+          PAYLOAD=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
+            | jq -r '.value' | cut -d. -f2 | tr '_-' '/+')
+          # pad base64 and decode
+          case $((${#PAYLOAD} % 4)) in 2) PAYLOAD="${PAYLOAD}==";; 3) PAYLOAD="${PAYLOAD}=";; esac
+          echo "$PAYLOAD" | base64 -d | jq '{sub, aud, repository, repository_id, repository_owner, repository_owner_id, environment}'
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a #v4
+        with:
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-test-repo-dev-admin-${{ github.run_id }}
+
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f #v3
+
+      - name: Fetch secrets from AWS Secrets Manager
+        env:
+          SECRETS_ARN: ${{ secrets.WEB_SECRETS_ARN }}
+        run: |
+          aws secretsmanager get-secret-value \
+            --secret-id "${SECRETS_ARN}" \
+            --region "${AWS_REGION}" \
+            --query 'SecretString' \
+            --output text \
+          | jq -r 'to_entries[] | "\(.key)=\(.value)"' > /tmp/web.env
+
+      - name: Create ECR Repo
+        run: |
+          aws ecr describe-repositories --repository-names "${ECR_REPO}" \
+            || aws ecr create-repository --repository-name "${ECR_REPO}"
+
+          # Enable ECR scan-on-push so every new image is automatically scanned for vulnerabilities
+          aws ecr put-image-scanning-configuration \
+            --repository-name "${ECR_REPO}" \
+            --image-scanning-configuration scanOnPush=true \
+            --region "${AWS_REGION}"
+
+          cat > ecr_policy.json <<'EOF'
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keeping latest 3 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 3
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+          EOF
+
+          aws ecr put-lifecycle-policy \
+            --repository-name "${ECR_REPO}" \
+            --lifecycle-policy-text "file://ecr_policy.json"
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+      - name: Build Docker Image
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          docker build \
+            --load \
+            --secret id=env_file,src=/tmp/admin.env \
+            -f "${DOCKERFILE_PATH}" \
+            -t "${ECR_REPO}:${BUILD_NUMBER}" .
+
+          docker tag "${ECR_REPO}:${BUILD_NUMBER}" \
+            "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${BUILD_NUMBER}"
+
+          docker images
+
+      - name: Trivy vulnerability scan
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy
+          trivy image \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --exit-code 1 \
+            --no-progress \
+            "${ECR_REPO}:${{ github.run_number }}"
+
+      - name: Push Docker Image to ECR
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          docker push "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${BUILD_NUMBER}"
+
+      - name: Clean up Docker images from runner
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          docker rmi "${ECR_REPO}:${BUILD_NUMBER}" || true
+          docker rmi "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${BUILD_NUMBER}" || true
+
+      - name: Register ECS Task Definition
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          SECRETS_ARN: ${{ secrets.WEB_SECRETS_ARN }}
+        run: |
+          SECRETS_BLOCK=$(aws secretsmanager get-secret-value \
+            --secret-id "${SECRETS_ARN}" \
+            --region "${AWS_REGION}" \
+            --query 'SecretString' --output text \
+          | jq -c '[to_entries[] | {"name": .key, "valueFrom": ("'"${SECRETS_ARN}"'" + ":" + .key + "::")}]')
+
+          cat > task_definition.json <<EOF
+          {
+            "family": "${ECS_TASK_DEFINITION_NAME}",
+            "taskRoleArn": "",
+            "executionRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/test-repo-dev-ecs-task-execution-role",
+            "containerDefinitions": [
+              {
+                "name": "${ECS_CONTAINER_NAME}",
+                "image": "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${BUILD_NUMBER}",
+                "portMappings": [
+                  {
+                    "hostPort": 0,
+                    "protocol": "tcp",
+                    "containerPort": ${ECS_CONTAINER_PORT}
+                  }
+                ],
+                "essential": true,
+                "secrets": ${SECRETS_BLOCK},
+                "healthCheck": {
+                  "command": [
+                    "CMD-SHELL",
+                    "curl -f http://${HEALTH_CHECK_PATH_ECS} || exit 1"
+                  ],
+                  "interval": 30,
+                  "timeout": 5,
+                  "retries": 5,
+                  "startPeriod": 30
+                },
+                "logConfiguration": {
+                  "logDriver": "json-file",
+                  "options": {
+                    "max-size": "50m",
+                    "max-file": "3"
+                  }
+                },
+                "dockerLabels": {
+                  "com.datadoghq.ad.logs": "[{\"source\": \"nodejs\", \"service\": \"${DD_SERVICE}\"}]",
+                  "com.datadoghq.tags.env": "${DD_ENV}",
+                  "com.datadoghq.tags.service": "${DD_SERVICE}",
+                  "com.datadoghq.tags.version": "${GITHUB_SHA}"
+                },
+                "cpu": ${CPU},
+                "memory": ${MEMORY},
+                "readonlyRootFilesystem": true,
+                "environment": [
+                  { "name": "HOME", "value": "/tmp" }
+                ],
+                "linuxParameters": {
+                  "initProcessEnabled": true,
+                  "tmpfs": [
+                    { "containerPath": "/tmp", "size": 64 },
+                    { "containerPath": "/app/apps/admin/node_modules/.vite-temp", "size": 16 }
+                  ]
+                }
+              }
+            ],
+            "requiresCompatibilities": ["EC2"],
+            "cpu": "${CPU}",
+            "memory": "${MEMORY}",
+            "pidMode": "task",
+            "ipcMode": "task"
+          }
+          EOF
+
+          aws ecs register-task-definition \
+            --cli-input-json file://task_definition.json \
+            --region "${AWS_REGION}"
+
+      - name: Deploy to ECS (create or update service)
+        run: |
+          latest_version=$(aws ecs describe-task-definition \
+            --task-definition "${ECS_TASK_DEFINITION_NAME}" \
+            --region "${AWS_REGION}" | jq .taskDefinition.revision)
+          echo "Latest version is $latest_version"
+
+          ECS_SERVICES=$(aws ecs list-services --cluster "${CLUSTER}" --output json --query "serviceArns" \
+            | jq -r '.[]' | awk -F'/' '{print $NF}')
+          if [ -z "$ECS_SERVICES" ]; then
+            ECS_SERVICES="__no_services__"
+          fi
+          echo "$ECS_SERVICES" > services.txt
+
+          if grep -F "${SERVICE}" services.txt; then
+            echo "This service already exists, so updating it"
+            aws ecs update-service \
+              --cluster "${CLUSTER}" \
+              --region "${AWS_REGION}" \
+              --service "${SERVICE}" \
+              --task-definition "${ECS_TASK_DEFINITION_NAME}:${latest_version}"
+            if ! timeout 750 aws ecs wait services-stable \
+              --cluster "${CLUSTER}" \
+              --region "${AWS_REGION}" \
+              --services "${SERVICE}"; then
+              echo "::error::Service failed to stabilize. Fetching stopped task details..."
+              STOPPED_TASKS=$(aws ecs list-tasks \
+                --cluster "${CLUSTER}" \
+                --service-name "${SERVICE}" \
+                --desired-status STOPPED \
+                --region "${AWS_REGION}" \
+                --query 'taskArns[]' \
+                --output text 2>/dev/null | tr '\t' '\n' | head -3) || STOPPED_TASKS=""
+              for TASK_ARN in $STOPPED_TASKS; do
+                TASK_ID=$(echo "$TASK_ARN" | awk -F'/' '{print $NF}')
+                echo "====== Task: $TASK_ID ======"
+                aws ecs describe-tasks \
+                  --cluster "${CLUSTER}" \
+                  --tasks "$TASK_ARN" \
+                  --region "${AWS_REGION}" \
+                  --query 'tasks[0].{StopCode:stopCode,StoppedReason:stoppedReason,Containers:containers[*].{Name:name,Reason:reason,ExitCode:exitCode}}' \
+                  --output json
+              done
+              exit 1
+            fi
+          else
+            echo "Service does not exist - creating from scratch"
+
+            echo "Creating Target Group"
+
+            TARGET_GROUP_ARN=$(aws elbv2 create-target-group \
+              --name "${TARGET_GROUP_NAME}" \
+              --protocol HTTP \
+              --port 80 \
+              --target-type instance \
+              --vpc-id "${VPC_ID}" \
+              --health-check-path "${HEALTH_CHECK_PATH_TG}" \
+              --query 'TargetGroups[0].TargetGroupArn' \
+              --output text)
+
+            highest_number=$(aws elbv2 describe-rules \
+              --listener-arn "${ALB_LISTENER_ARN}" \
+              --query 'Rules[].Priority' \
+              --output text | tr '\t' '\n' | grep -v default | sort -n | tail -n 1)
+            NEW_PRIORITY=$((highest_number + 1))
+
+            echo "Creating ALB Rule"
+
+            aws elbv2 create-rule \
+              --listener-arn "${ALB_LISTENER_ARN}" \
+              --priority "${NEW_PRIORITY}" \
+              --conditions Field=host-header,Values=["${HOST}"] \
+              --actions Type=forward,TargetGroupArn="${TARGET_GROUP_ARN}" \
+              || { aws elbv2 delete-target-group --target-group-arn "${TARGET_GROUP_ARN}"; exit 1; }
+
+            echo "Getting rule arn"
+            rule_arn=$(aws elbv2 describe-rules --listener-arn "${ALB_LISTENER_ARN}" \
+              | jq -r '.Rules[] | select(.Conditions[]?.Field == "host-header" and .Conditions[]?.Values[] == "'"${HOST}"'") | .RuleArn')
+
+            echo "Creating ECS Service"
+
+            aws ecs create-service \
+              --cluster "${CLUSTER}" \
+              --service-name "${SERVICE}" \
+              --task-definition "${ECS_TASK_DEFINITION_NAME}:${latest_version}" \
+              --desired-count 1 \
+              --placement-strategy type="binpack",field="memory" \
+              --load-balancers targetGroupArn="${TARGET_GROUP_ARN}",containerName="${ECS_CONTAINER_NAME}",containerPort="${ECS_CONTAINER_PORT}" \
+              || { aws elbv2 delete-rule --rule-arn "${rule_arn}"; aws elbv2 delete-target-group --target-group-arn "${TARGET_GROUP_ARN}"; exit 1; }
+
+            if ! timeout 750 aws ecs wait services-stable \
+              --cluster "${CLUSTER}" \
+              --region "${AWS_REGION}" \
+              --services "${SERVICE}"; then
+              echo "::error::Service failed to stabilize. Fetching stopped task details..."
+              STOPPED_TASKS=$(aws ecs list-tasks \
+                --cluster "${CLUSTER}" \
+                --service-name "${SERVICE}" \
+                --desired-status STOPPED \
+                --region "${AWS_REGION}" \
+                --query 'taskArns[]' \
+                --output text 2>/dev/null | tr '\t' '\n' | head -3) || STOPPED_TASKS=""
+              for TASK_ARN in $STOPPED_TASKS; do
+                TASK_ID=$(echo "$TASK_ARN" | awk -F'/' '{print $NF}')
+                echo "====== Task: $TASK_ID ======"
+                aws ecs describe-tasks \
+                  --cluster "${CLUSTER}" \
+                  --tasks "$TASK_ARN" \
+                  --region "${AWS_REGION}" \
+                  --query 'tasks[0].{StopCode:stopCode,StoppedReason:stoppedReason,Containers:containers[*].{Name:name,Reason:reason,ExitCode:exitCode}}' \
+                  --output json
+              done
+              exit 1
+            fi
+          fi
+
+          rm -f services.txt
+
+      - name: Pipeline success
+        if: success()
+        run: echo "pipeline success."
+
+      - name: Pipeline failure
+        if: failure()
+        run: echo "pipeline failed."

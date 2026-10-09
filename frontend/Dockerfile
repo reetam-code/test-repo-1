@@ -6,7 +6,7 @@ COPY package*.json ./
 RUN npm ci
 
 COPY . .
-RUN npm run build
+RUN --mount=type=secret,id=env_file,target=/app/.env npm run build
 
 FROM nginx:alpine
 
